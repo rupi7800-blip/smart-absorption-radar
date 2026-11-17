@@ -86,6 +86,14 @@ Una candela rossa con volume alto **non** basta: servono recupero e discrepanza 
 
 CONTESTO, direzione di entrambi gli HTF, SETUP, DIREZIONE, DECISIONE CLAUDE, operazioni e stop giornalieri, rischio residuo, risultato del giorno, stato e avvisi sui dati. **DECISIONE CLAUDE e' un input manuale**: Pine non puo' ricevere la risposta del server.
 
+## Scelte di progetto da validare
+
+- **Conferma nella stessa barra della registrazione**: il secondo tentativo viene registrato dopo `followBars` barre di verifica. Se quella barra chiude gia' oltre il massimo della candela di assorbimento, `SECOND_ATTEMPT` e `CONFIRMATION` partono sulla stessa barra chiusa (mai in formazione). Se si preferisce una barra separata, serve la guardia `bar_index > regIdx` in `f_step`.
+- Dal terzo tentativo in poi l'evento resta `SECOND_ATTEMPT` con `attempt_count` > 2 (l'etichetta sul grafico mostra il numero).
+- Le chiavi JSON `fibonacci_705` e `fibonacci_886` contengono i livelli degli input A/B; i rapporti effettivi sono in `fibonacci_ratios`.
+- Un'operazione chiusa e una nuova possono avvenire sulla stessa barra: i limiti giornaliero si applicano comunque al momento dell'apertura.
+- Un assorbimento valido sulla stessa barra di un'invalidazione non avvia un nuovo setup: riparte dalla barra successiva (scelta prudente).
+
 ## Limiti noti
 
 - Nessuna verifica di compilazione, backtest o paper trading ancora eseguiti.

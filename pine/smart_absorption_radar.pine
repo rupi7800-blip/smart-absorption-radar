@@ -278,7 +278,7 @@ if nz(volume) > 0
     cumV += volume
 float vwap = cumV > 0 ? cumPV / cumV : na
 float dayRng = dayH - dayL
-bool  rangeValid = not na(atr) and dayBars >= minDayBars and dayRng >= minDayRangeATR * atr
+bool  rangeValid = not na(atr) and dayRng > 0 and dayBars >= minDayBars and dayRng >= minDayRangeATR * atr
 float dayMid = (dayH + dayL) / 2
 f_pos(float p) => rangeValid ? (p - dayL) / dayRng : na
 
