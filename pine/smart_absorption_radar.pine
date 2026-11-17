@@ -1,0 +1,939 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+//@version=6
+// =====================================================================================
+// SMART ABSORPTION RADAR (SAR)  -  Componente A (TradingView)
+// -------------------------------------------------------------------------------------
+// Indicatore selettivo: segnala setup LONG/SHORT solo quando TUTTE le condizioni sono vere:
+//   contesto HTF confermato -> zona valutazione (range giornaliero) -> zona Fibonacci
+//   -> primo tentativo fallito -> secondo tentativo fallito (distinto) -> conferma a chiusura
+//   -> stop strutturale, target strutturale, R:R minimo, limiti giornalieri.
+//
+// NOTE DI METODO (leggere):
+//  * "Assorbimento" e' una classificazione tecnica basata su evidenze INDIRETTE (OHLCV).
+//    Pine NON fornisce order flow, delta, footprint, liquidazioni ne' volume profile:
+//    questi dati NON sono simulati e compaiono in "unavailable_sources" nel JSON.
+//  * Tutta la logica di stato gira SOLO a barra chiusa (barstate.isconfirmed): nessun ingresso
+//    ne' evento su barre in formazione.
+//  * HTF: con "solo candele chiuse" attivo si usa request.security(expr[1], lookahead_on),
+//    il pattern documentato senza repainting.
+//  * Il "blocco giornaliero" e' simulato dall'indicatore sui dati del grafico. NON e' un
+//    registro di conto reale: il server deve applicare lo stesso blocco (vedi documentazione).
+//  * Nessuna chiave API in questo file. Il token webhook e' un segreto condiviso opzionale.
+// =====================================================================================
+indicator("Smart Absorption Radar", shorttitle="SAR", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=200)
+
+const string VERSION = "1.0.0"
+const string SCHEMA  = "1.0"
+
+// ============================== INPUT ===============================================
+const string G_CTX = "1. Contesto multi-timeframe"
+string htfMid   = input.timeframe("60",  "TF conferma intermedio", group=G_CTX, tooltip="Default 1 ora. Deve essere >= TF del grafico.")
+string htfHigh  = input.timeframe("240", "TF conferma superiore",  group=G_CTX, tooltip="Default 4 ore. Deve essere >= TF intermedio.")
+bool   htfConfirmedOnly = input.bool(true, "Solo candele HTF chiuse (no repaint)", group=G_CTX, tooltip="Se attivo usa il valore dell'ultima candela HTF CHIUSA. Se disattivo il contesto puo' cambiare con candele HTF aperte (repainting_risk=true nel JSON).")
+int    htfPivLen = input.int(3, "Pivot struttura HTF (barre per lato)", minval=1, group=G_CTX)
+int    htfEmaFast = input.int(20, "EMA veloce HTF", minval=2, group=G_CTX)
+int    htfEmaSlow = input.int(50, "EMA lenta HTF", minval=3, group=G_CTX)
+string ctxMode = input.string("Entrambi allineati", "Regola contesto", options=["Entrambi allineati", "Superiore decide, intermedio non opposto"], group=G_CTX, tooltip="Rialzista/ribassista = struttura (HH/HL o LH/LL) + prezzo e EMA coerenti. Altrimenti EQUILIBRIO: nessun ingresso.")
+
+const string G_VAL = "2. Valutazione (range giornaliero)"
+string tz = input.string("Europe/Rome", "Fuso orario (conteggio giorno e sessioni)", group=G_VAL, tooltip="Nome IANA (es. Europe/Rome, America/New_York, UTC). Usato per reset giornaliero, VWAP e limiti operativi.")
+float  underPct = input.float(0.35, "Sottovalutazione: fino a (quota del range)", minval=0.05, maxval=0.49, step=0.05, group=G_VAL)
+float  overPct  = input.float(0.65, "Sopravvalutazione: da (quota del range)", minval=0.51, maxval=0.95, step=0.05, group=G_VAL)
+float  entryLimit = input.float(0.50, "Limite posizione ingresso (LONG < x, SHORT > 1-x)", minval=0.2, maxval=0.5, step=0.05, group=G_VAL, tooltip="Impedisce ingressi nella meta' sfavorevole del range. Il centro non e' zona privilegiata.")
+int    minDayBars = input.int(12, "Barre minime nel giorno", minval=1, group=G_VAL)
+float  minDayRangeATR = input.float(2.0, "Range giornaliero minimo (x ATR)", minval=0.5, step=0.5, group=G_VAL)
+string sessA = input.session("0000-0800", "Sessione A (es. Asia)", group=G_VAL)
+string sessB = input.session("0800-1600", "Sessione B (es. Londra)", group=G_VAL)
+
+const string G_FIB = "3. Swing e Fibonacci"
+int    pivL = input.int(5, "Pivot swing: barre a sinistra", minval=1, group=G_FIB)
+int    pivR = input.int(5, "Pivot swing: barre a destra (conferma)", minval=1, group=G_FIB)
+float  swingMinATR = input.float(4.0, "Ampiezza minima swing (x ATR)", minval=0.5, step=0.5, group=G_FIB)
+float  swingMinPct = input.float(0.30, "Ampiezza minima swing (%)", minval=0.0, step=0.05, group=G_FIB)
+int    swingMaxAge = input.int(600, "Eta' massima swing (barre)", minval=20, group=G_FIB)
+float  fibA = input.float(0.705, "Livello Fibonacci A", minval=0.1, maxval=1.0, step=0.001, group=G_FIB)
+float  fibB = input.float(0.886, "Livello Fibonacci B", minval=0.1, maxval=1.0, step=0.001, group=G_FIB)
+float  fibTolATR = input.float(0.25, "Tolleranza zona Fib (x ATR)", minval=0.0, step=0.05, group=G_FIB)
+
+const string G_ABS = "4. Rilevamento assorbimento (candela)"
+int    atrLen = input.int(14, "Periodo ATR", minval=2, group=G_ABS)
+int    volLen = input.int(20, "Periodo media volume", minval=2, group=G_ABS)
+float  volMult = input.float(1.5, "Volume relativo minimo", minval=0.5, step=0.1, group=G_ABS)
+bool   requireVolume = input.bool(true, "Richiedi volume (se non disponibile: nessun segnale)", group=G_ABS, tooltip="Disattivare solo per strumenti senza volume: il JSON dichiarera' relative_volume mancante.")
+float  minEffort = input.float(1.0, "Sforzo/risultato minimo (volume rel. / range in ATR)", minval=0.1, step=0.1, group=G_ABS)
+float  minRangeATR = input.float(0.8, "Range candela minimo (x ATR)", minval=0.1, step=0.1, group=G_ABS)
+float  maxRangeATR = input.float(3.5, "Range candela massimo (x ATR)", minval=0.5, step=0.1, group=G_ABS)
+float  minCloseLoc = input.float(0.50, "Posizione chiusura nel range (>=)", minval=0.0, maxval=1.0, step=0.05, group=G_ABS, tooltip="Per LONG: (close-low)/range. Per SHORT specchiato.")
+float  minWick = input.float(0.35, "Ombra di rifiuto minima (quota range)", minval=0.0, maxval=1.0, step=0.05, group=G_ABS)
+float  maxEff = input.float(0.50, "Efficienza prezzo massima (corpo avverso netto / range)", minval=0.0, maxval=1.0, step=0.05, group=G_ABS, tooltip="price_efficiency = max(open-close,0)/range per LONG (specchiato per SHORT). Basso = pressione senza risultato.")
+int    sweepN = input.int(5, "Barre per livello violato", minval=2, group=G_ABS)
+bool   requireReclaim = input.bool(true, "Richiedi recupero del livello violato", group=G_ABS)
+
+const string G_DBL = "5. Doppio fallimento e conferma"
+int    followBars = input.int(1, "Barre di verifica mancata prosecuzione", minval=1, maxval=5, group=G_DBL)
+float  followTolATR = input.float(0.10, "Tolleranza prosecuzione (x ATR)", minval=0.0, step=0.05, group=G_DBL)
+int    minGap = input.int(5, "Distanza minima tra tentativi (barre)", minval=2, group=G_DBL)
+int    maxGap = input.int(60, "Distanza massima tra tentativi (barre)", minval=3, group=G_DBL)
+float  levelTolATR = input.float(0.75, "Tolleranza livello 2o tentativo (x ATR)", minval=0.0, step=0.05, group=G_DBL)
+float  reboundATR = input.float(1.0, "Rimbalzo minimo tra tentativi (x ATR)", minval=0.0, step=0.1, group=G_DBL, tooltip="Garantisce che i tentativi siano eventi distinti e non lo stesso movimento.")
+float  invalTolATR = input.float(0.25, "Invalidazione: chiusura oltre livello (x ATR)", minval=0.0, step=0.05, group=G_DBL)
+int    maxAttempts = input.int(3, "Tentativi massimi conteggiabili", minval=2, maxval=6, group=G_DBL)
+string confirmMode = input.string("Estremo candela", "Conferma finale", options=["Estremo candela", "Meta' candela"], group=G_DBL, tooltip="LONG: chiusura sopra il massimo (o la meta') della candela di assorbimento. SHORT: specchiato. Valutata solo a barra chiusa.")
+int    confirmMaxBars = input.int(6, "Finestra di conferma dopo 2o tentativo (barre)", minval=1, group=G_DBL)
+
+const string G_TRD = "6. Ingresso, stop e target"
+float  slAtrMargin = input.float(0.25, "Margine stop (x ATR)", minval=0.0, step=0.05, group=G_TRD)
+float  maxStopATR = input.float(3.0, "Stop massimo (x ATR)", minval=0.5, step=0.1, group=G_TRD)
+float  maxStopPct = input.float(2.0, "Stop massimo (% del prezzo)", minval=0.05, step=0.05, group=G_TRD)
+float  minRR = input.float(2.0, "Rapporto rischio/rendimento minimo", minval=0.5, step=0.1, group=G_TRD)
+string tpMode = input.string("Livello strutturale piu' vicino", "Modalita' take profit", options=["Livello strutturale piu' vicino", "Swing opposto (Fib 0)", "R fisso"], group=G_TRD, tooltip="Il target NON viene spostato per rispettare il R:R: se non conviene, nessun segnale.")
+float  tpMinATR = input.float(1.0, "Ignora livelli piu' vicini di (x ATR)", minval=0.0, step=0.1, group=G_TRD)
+float  tpFixedR = input.float(2.0, "R fisso (solo modalita' R fisso)", minval=0.5, step=0.1, group=G_TRD)
+
+const string G_RSK = "7. Gestione del capitale"
+float  capital = input.float(10000.0, "Capitale (nella valuta del simbolo)", minval=1.0, group=G_RSK)
+float  riskPct = input.float(0.5, "Rischio per operazione (% capitale)", minval=0.01, step=0.05, group=G_RSK)
+int    maxTrades = input.int(2, "Operazioni massime giornaliere", minval=1, group=G_RSK)
+int    maxLosses = input.int(2, "Stop loss massimi giornalieri", minval=1, group=G_RSK)
+float  pvOverride = input.float(0.0, "Valore per punto (0 = syminfo.pointvalue)", minval=0.0, group=G_RSK)
+float  qtyStep = input.float(0.001, "Passo quantita' (0 = nessun arrotondamento)", minval=0.0, group=G_RSK, tooltip="Dipende dallo strumento: verificare le specifiche del broker.")
+float  commPct = input.float(0.05, "Commissione % per lato", minval=0.0, step=0.01, group=G_RSK)
+float  commFixed = input.float(0.0, "Commissione fissa per unita'/lato", minval=0.0, group=G_RSK)
+float  slipTicks = input.float(2.0, "Slippage (tick) per lato", minval=0.0, group=G_RSK)
+float  maxLeverage = input.float(0.0, "Leva massima (0 = nessun limite)", minval=0.0, group=G_RSK)
+
+const string G_UI = "8. Interfaccia"
+bool   showPanel = input.bool(true, "Mostra pannello", group=G_UI)
+string panelPos = input.string("In alto a destra", "Posizione pannello", options=["In alto a destra", "In alto a sinistra", "In basso a destra", "In basso a sinistra"], group=G_UI)
+string panelSize = input.string("Normale", "Dimensione testo pannello", options=["Piccola", "Normale", "Grande"], group=G_UI, tooltip="Su smartphone usare Normale o Grande.")
+string claudeDecision = input.string("NON ANCORA VALUTATO", "Decisione Claude (impostazione manuale)", options=["NON ANCORA VALUTATO", "ENTRARE", "ASPETTARE", "SALTARE"], group=G_UI, tooltip="Pine non puo' ricevere la risposta del server: aggiornare a mano dal pannello di controllo.")
+bool   showZones = input.bool(true, "Mostra range, VWAP e zone valutazione", group=G_UI)
+bool   showFib = input.bool(true, "Mostra swing e zona Fibonacci", group=G_UI)
+bool   showLabels = input.bool(true, "Mostra etichette tentativi e segnali", group=G_UI)
+color  cLong = input.color(#26a69a, "Colore LONG", group=G_UI)
+color  cShort = input.color(#ef5350, "Colore SHORT", group=G_UI)
+
+const string G_ALR = "9. Webhook"
+bool   sendJson = input.bool(true, "Invia JSON con alert()", group=G_ALR, tooltip="Creare un alert con condizione 'Smart Absorption Radar' > 'Qualsiasi chiamata alert() di funzione'.")
+string webhookToken = input.string("", "Token condiviso (opzionale)", group=G_ALR, tooltip="NON inserire chiavi API. E' solo un segreto condiviso con il TUO server, incluso nel JSON (meta.auth). Mantenere lo script privato.")
+
+// ============================== TIPI ================================================
+// Tutti i prezzi nel tracker sono "specchiati" (moltiplicati per la direzione d: +1 LONG, -1 SHORT)
+// cosi' la stessa logica serve LONG e SHORT.
+type Trk
+    int state = 0
+    int evA = 0
+    int evF = 0
+    string reason = ""
+    bool pend = false
+    int pIdx = na
+    float pExt = na
+    float pTop = na
+    float pRelVol = na
+    float pEff = na
+    int pLeft = 0
+    float pRun = na
+    float pSnap = na
+    int pSwing = na
+    int a1Idx = na
+    float a1Ext = na
+    float a1Top = na
+    float a1RelVol = na
+    float a1Eff = na
+    int aLIdx = na
+    float aLExt = na
+    float aLTop = na
+    float aLRelVol = na
+    float aLEff = na
+    float runL = na
+    int cnt = 0
+    int swingAt = na
+    int regIdx = na
+    bool invFirst = false
+    bool invSecond = false
+    float invLvl = na
+    int invCnt = 0
+    line lvl = na
+
+type Bk
+    int tradesToday = 0
+    int lossesToday = 0
+    float dayPnl = 0.0
+    bool blocked = false
+    string blockReason = ""
+    int sigDir = 0
+    bool inTrade = false
+    int dir = 0
+    float entry = na
+    float sl = na
+    float tp = na
+    float qty = na
+    float riskAmt = na
+    float rr = na
+    int idx = na
+    int lastInv = -100000
+    int lastConf = -100000
+    line lnE = na
+    line lnS = na
+    line lnT = na
+    int totalTrades = 0
+    int wins = 0
+    int losses = 0
+    float sumR = 0.0
+
+var Bk bk = Bk.new()
+
+// ============================== FUNZIONI HTF / SESSIONI ============================
+// Struttura HTF: HH+HL (o LH+LL) dai pivot + prezzo/EMA coerenti. Valutata nel contesto HTF.
+f_htf_trend(int pLen, int fastLen, int slowLen) =>
+    float ph = ta.pivothigh(high, pLen, pLen)
+    float pl = ta.pivotlow(low, pLen, pLen)
+    var float h1 = na
+    var float h2 = na
+    var float l1 = na
+    var float l2 = na
+    if not na(ph)
+        h2 := h1
+        h1 := ph
+    if not na(pl)
+        l2 := l1
+        l1 := pl
+    float ef = ta.ema(close, fastLen)
+    float es = ta.ema(close, slowLen)
+    bool sUp = h1 > h2 and l1 > l2
+    bool sDn = h1 < h2 and l1 < l2
+    bool mUp = close > es and ef > es
+    bool mDn = close < es and ef < es
+    int r = (sUp and mUp) ? 1 : (sDn and mDn) ? -1 : 0
+    r
+
+// Valore dell'ultima candela HTF chiusa (da usare con lookahead_on: pattern no-repaint).
+f_htf_prev(int pLen, int fastLen, int slowLen) =>
+    int t = f_htf_trend(pLen, fastLen, slowLen)
+    t[1]
+
+// Massimo/minimo di una sessione: corrente e ultima completata.
+f_session(string sess, string zone) =>
+    bool inS = not na(time(timeframe.period, sess, zone))
+    var float cH = na
+    var float cL = na
+    var float lH = na
+    var float lL = na
+    if inS
+        if not inS[1]
+            cH := high
+            cL := low
+        else
+            cH := math.max(cH, high)
+            cL := math.min(cL, low)
+    else if inS[1]
+        lH := cH
+        lL := cL
+    [cH, cL, lH, lL]
+
+// Livello specchiato piu' vicino sopra la soglia (specchiato).
+f_nearest(array<float> lv, float th) =>
+    float best = na
+    for v in lv
+        if not na(v) and v > th
+            best := na(best) ? v : math.min(best, v)
+    best
+
+// ============================== SERIE DI BASE =======================================
+bool  conf = barstate.isconfirmed
+float atr = ta.atr(atrLen)
+float volSma = ta.sma(volume, volLen)
+bool  volAvail = not na(volSma) and volSma > 0 and nz(volume) > 0
+float relVol = volAvail ? volume / volSma : na
+float lowestN = ta.lowest(low, sweepN)[1]
+float highestN = ta.highest(high, sweepN)[1]
+
+// ---- Giorno nel fuso configurato (reset a mezzanotte del fuso) ----
+int  dKey = year(time, tz) * 10000 + month(time, tz) * 100 + dayofmonth(time, tz)
+bool newDay = dKey != nz(dKey[1])
+
+var float dayO = na
+var float dayH = na
+var float dayL = na
+var float prevDayH = na
+var float prevDayL = na
+var float cumPV = 0.0
+var float cumV = 0.0
+var int   dayBars = 0
+if newDay
+    prevDayH := dayH
+    prevDayL := dayL
+    dayO := open
+    dayH := high
+    dayL := low
+    cumPV := 0.0
+    cumV := 0.0
+    dayBars := 1
+else
+    dayH := math.max(dayH, high)
+    dayL := math.min(dayL, low)
+    dayBars += 1
+if nz(volume) > 0
+    cumPV += hlc3 * volume
+    cumV += volume
+float vwap = cumV > 0 ? cumPV / cumV : na
+float dayRng = dayH - dayL
+bool  rangeValid = not na(atr) and dayRng > 0 and dayBars >= minDayBars and dayRng >= minDayRangeATR * atr
+float dayMid = (dayH + dayL) / 2
+f_pos(float p) => rangeValid ? (p - dayL) / dayRng : na
+
+[sAH, sAL, sAlH, sAlL] = f_session(sessA, tz)
+[sBH, sBL, sBlH, sBlL] = f_session(sessB, tz)
+
+// ---- Contesto multi-timeframe ----
+bool htfOk = timeframe.in_seconds(htfMid) >= timeframe.in_seconds() and timeframe.in_seconds(htfHigh) >= timeframe.in_seconds(htfMid)
+int tMidC = request.security(syminfo.tickerid, htfMid, f_htf_prev(htfPivLen, htfEmaFast, htfEmaSlow), lookahead=barmerge.lookahead_on)
+int tMidL = request.security(syminfo.tickerid, htfMid, f_htf_trend(htfPivLen, htfEmaFast, htfEmaSlow))
+int tHighC = request.security(syminfo.tickerid, htfHigh, f_htf_prev(htfPivLen, htfEmaFast, htfEmaSlow), lookahead=barmerge.lookahead_on)
+int tHighL = request.security(syminfo.tickerid, htfHigh, f_htf_trend(htfPivLen, htfEmaFast, htfEmaSlow))
+int tMid = htfOk ? nz(htfConfirmedOnly ? tMidC : tMidL) : 0
+int tHigh = htfOk ? nz(htfConfirmedOnly ? tHighC : tHighL) : 0
+int mState = 0
+if htfOk
+    if ctxMode == "Entrambi allineati"
+        mState := (tMid == 1 and tHigh == 1) ? 1 : (tMid == -1 and tHigh == -1) ? -1 : 0
+    else
+        mState := (tHigh != 0 and tMid != -tHigh) ? tHigh : 0
+bool trendAligned = tMid != 0 and tMid == tHigh
+
+// ============================== SWING E FIBONACCI ===================================
+// Pivot confermati (barre chiuse + pivR barre a destra). Nessuna modifica retroattiva silenziosa:
+// ogni cambio di swing incrementa l'id, viene disegnato e invalida i setup in corso.
+float phRaw = ta.pivothigh(high, pivL, pivR)
+float plRaw = ta.pivotlow(low, pivL, pivR)
+float ph = conf ? phRaw : na
+float pl = conf ? plRaw : na
+
+var int   lastPiv = 0
+var float pHiP = na
+var int   pHiI = na
+var int   pLoI = na
+var float pLoP = na
+var float upA = na
+var float upB = na
+var int   upAi = na
+var int   upBi = na
+var int   upId = 0
+var bool  upOk = false
+var float dnA = na
+var float dnB = na
+var int   dnAi = na
+var int   dnBi = na
+var int   dnId = 0
+var bool  dnOk = false
+bool upNew = false
+bool dnNew = false
+
+if conf
+    // invalidazione swing (prima dei nuovi pivot, cosi' un nuovo swing nasce valido)
+    if upOk and (close < upA or high > upB or bar_index - upBi > swingMaxAge)
+        upOk := false
+    if dnOk and (close > dnA or low < dnB or bar_index - dnBi > swingMaxAge)
+        dnOk := false
+
+if not na(ph)
+    if lastPiv != 1 or ph > pHiP
+        if not na(pLoP)
+            float sz = ph - pLoP
+            bool big = sz >= swingMinATR * atr and sz / ph * 100 >= swingMinPct
+            bool repl = not upOk or ph > upB or bar_index - upBi > swingMaxAge
+            if big and repl
+                upA := pLoP
+                upAi := pLoI
+                upB := ph
+                upBi := bar_index - pivR
+                upOk := true
+                upId += 1
+                upNew := true
+        pHiP := ph
+        pHiI := bar_index - pivR
+        lastPiv := 1
+if not na(pl)
+    if lastPiv != -1 or pl < pLoP
+        if not na(pHiP)
+            float sz = pHiP - pl
+            bool big = sz >= swingMinATR * atr and sz / pHiP * 100 >= swingMinPct
+            bool repl = not dnOk or pl < dnB or bar_index - dnBi > swingMaxAge
+            if big and repl
+                dnA := pHiP
+                dnAi := pHiI
+                dnB := pl
+                dnBi := bar_index - pivR
+                dnOk := true
+                dnId += 1
+                dnNew := true
+        pLoP := pl
+        pLoI := bar_index - pivR
+        lastPiv := -1
+
+// Livelli Fibonacci (prezzi) per LONG (ritracciamento da B verso A) e SHORT (da B verso A).
+float upRng = upB - upA
+float upFibA = upOk ? upB - fibA * upRng : na
+float upFibB = upOk ? upB - fibB * upRng : na
+float dnRng = dnA - dnB
+float dnFibA = dnOk ? dnB + fibA * dnRng : na
+float dnFibB = dnOk ? dnB + fibB * dnRng : na
+float fibTol = fibTolATR * nz(atr)
+
+// ============================== LOGICA DI STATO (specchiata) ========================
+f_reset(Trk t) =>
+    t.state := 0
+    t.pend := false
+    t.pIdx := na
+    t.pExt := na
+    t.pTop := na
+    t.pRelVol := na
+    t.pEff := na
+    t.pLeft := 0
+    t.pRun := na
+    t.pSnap := na
+    t.pSwing := na
+    t.a1Idx := na
+    t.a1Ext := na
+    t.a1Top := na
+    t.aLIdx := na
+    t.aLExt := na
+    t.aLTop := na
+    t.runL := na
+    t.cnt := 0
+    t.swingAt := na
+    t.regIdx := na
+
+f_invalidate(Trk t, string why) =>
+    t.evF := 4
+    t.reason := why
+    t.invFirst := t.state >= 1
+    t.invSecond := t.state >= 2
+    t.invCnt := t.cnt
+    t.invLvl := math.min(nz(t.a1Ext, 1e15), nz(t.aLExt, 1e15))
+    f_reset(t)
+
+// Registra il candidato in attesa dopo le barre di verifica.
+f_register(Trk t, int swingId) =>
+    if t.state == 0
+        t.a1Idx := t.pIdx
+        t.a1Ext := t.pExt
+        t.a1Top := t.pTop
+        t.a1RelVol := t.pRelVol
+        t.a1Eff := t.pEff
+        t.aLIdx := t.pIdx
+        t.aLExt := t.pExt
+        t.aLTop := t.pTop
+        t.aLRelVol := t.pRelVol
+        t.aLEff := t.pEff
+        t.runL := t.pRun
+        t.cnt := 1
+        t.state := 1
+        t.swingAt := swingId
+        t.evA := 1
+    else
+        int gap = t.pIdx - t.aLIdx
+        bool deeper = t.pExt < t.a1Ext - levelTolATR * atr
+        bool rebound = not na(t.pSnap) and t.pSnap - t.aLExt >= reboundATR * atr
+        if deeper
+            // livello non tenuto: il vecchio setup decade e questo candidato riparte come primo tentativo
+            int keepIdx = t.pIdx
+            float keepExt = t.pExt
+            float keepTop = t.pTop
+            float keepRv = t.pRelVol
+            float keepEff = t.pEff
+            float keepRun = t.pRun
+            f_invalidate(t, "level_violated_by_deeper_test")
+            t.a1Idx := keepIdx
+            t.a1Ext := keepExt
+            t.a1Top := keepTop
+            t.a1RelVol := keepRv
+            t.a1Eff := keepEff
+            t.aLIdx := keepIdx
+            t.aLExt := keepExt
+            t.aLTop := keepTop
+            t.aLRelVol := keepRv
+            t.aLEff := keepEff
+            t.runL := keepRun
+            t.cnt := 1
+            t.state := 1
+            t.swingAt := swingId
+            t.evA := 1
+        else if gap >= minGap and gap <= maxGap and rebound
+            t.aLIdx := t.pIdx
+            t.aLExt := t.pExt
+            t.aLTop := t.pTop
+            t.aLRelVol := t.pRelVol
+            t.aLEff := t.pEff
+            t.runL := t.pRun
+            t.cnt += 1
+            t.state := 2
+            t.regIdx := bar_index
+            if t.cnt > maxAttempts
+                f_invalidate(t, "too_many_tests")
+            else
+                t.evA := 2
+
+// Un passo di logica a barra chiusa. Prezzi specchiati: mo/mh/ml/mc = d*open/high/low/close
+// (per SHORT mh = -low e ml = -high). candOk = contesto+zona valutazione+zona Fib per questa candela.
+f_step(Trk t, bool allowed, bool candOk, bool swingValid, int swingId, float mo, float mh, float ml, float mc, float sweepRef) =>
+    t.evA := 0
+    t.evF := 0
+    t.reason := ""
+    if conf and not na(atr) and atr > 0
+        // A. invalidazioni
+        if t.state >= 1
+            string why = ""
+            float lvl = math.min(t.a1Ext, t.aLExt)
+            if not allowed
+                why := "context_changed_or_blocked"
+            else if not swingValid
+                why := "swing_invalid_or_broken"
+            else if swingId != t.swingAt
+                why := "swing_reference_changed"
+            else if mc < lvl - invalTolATR * atr
+                why := "level_broken"
+            else if t.state == 1 and bar_index - t.aLIdx > maxGap
+                why := "second_attempt_window_expired"
+            else if t.state == 2 and bar_index - t.regIdx > confirmMaxBars
+                why := "confirmation_window_expired"
+            if why != ""
+                f_invalidate(t, why)
+        bool alive = t.evF == 0
+        // B. candidato in verifica (mancata prosecuzione)
+        if alive and t.pend
+            t.pRun := na(t.pRun) ? mh : math.max(t.pRun, mh)
+            if ml < t.pExt - followTolATR * atr
+                t.pend := false
+            else
+                t.pLeft -= 1
+                if t.pLeft <= 0
+                    t.pend := false
+                    if allowed and swingValid and swingId == t.pSwing
+                        f_register(t, swingId)
+        alive := t.evF == 0
+        // C. conferma finale (solo a chiusura)
+        if alive and t.state == 2 and bar_index > t.aLIdx
+            float cl = confirmMode == "Estremo candela" ? t.aLTop : (t.aLTop + t.aLExt) / 2
+            if mc > cl
+                t.evF := 3
+        // D. nuovo candidato (assorbimento)
+        if alive and t.evF == 0 and not t.pend and candOk
+            float rng = mh - ml
+            if rng > 0
+                float rangeATR = rng / atr
+                float closeLoc = (mc - ml) / rng
+                float lowWick = (math.min(mo, mc) - ml) / rng
+                float eff = math.max(mo - mc, 0.0) / rng
+                bool sweep = ml < sweepRef
+                bool reclaim = not requireReclaim or mc >= sweepRef
+                bool volOk = volAvail ? (relVol >= volMult and relVol / rangeATR >= minEffort) : not requireVolume
+                if rangeATR >= minRangeATR and rangeATR <= maxRangeATR and closeLoc >= minCloseLoc and lowWick >= minWick and eff <= maxEff and sweep and reclaim and volOk
+                    t.pend := true
+                    t.pIdx := bar_index
+                    t.pExt := ml
+                    t.pTop := mh
+                    t.pRelVol := relVol
+                    t.pEff := eff
+                    t.pLeft := followBars
+                    t.pRun := na
+                    t.pSnap := t.state >= 1 ? t.runL : na
+                    t.pSwing := swingId
+        // E. aggiorna il massimo dopo l'ultimo tentativo (rimbalzo)
+        if t.state >= 1 and not na(t.runL)
+            t.runL := math.max(t.runL, mh)
+
+// ============================== JSON ================================================
+f_n(float x) => na(x) ? "null" : str.tostring(x, "#.########")
+f_b(bool x) => x ? "true" : "false"
+f_esc(string s) => str.replace_all(str.replace_all(s, "\\", "\\\\"), "\"", "\\\"")
+f_s(string x) => na(x) ? "null" : "\"" + f_esc(x) + "\""
+f_trendS(int x) => x == 1 ? "bullish" : x == -1 ? "bearish" : "neutral"
+f_ctxS(int x) => x == 1 ? "bullish" : x == -1 ? "bearish" : "equilibrium"
+f_zoneS() =>
+    float p = f_pos(close)
+    string r = na
+    if not na(p)
+        r := p <= underPct ? "undervalued" : p >= overPct ? "overvalued" : "equilibrium"
+    r
+
+f_missing(bool trade, float entry, float sl, float tp, float rr, float qty, float rv, float eff, float fa, float fb) =>
+    array<string> m = array.new<string>()
+    if na(dayH) or na(dayL)
+        array.push(m, "daily_high_low")
+    if na(vwap)
+        array.push(m, "vwap")
+    if na(rv)
+        array.push(m, "relative_volume")
+    if na(eff)
+        array.push(m, "price_efficiency")
+    if na(fa) or na(fb)
+        array.push(m, "fibonacci_levels")
+    if trade
+        if na(entry)
+            array.push(m, "entry")
+        if na(sl)
+            array.push(m, "stop_loss")
+        if na(tp)
+            array.push(m, "take_profit")
+        if na(rr)
+            array.push(m, "risk_reward")
+        if na(qty)
+            array.push(m, "position_size")
+    // Con array vuoto "0 to -1" conterebbe all'indietro: si usa join.
+    string out = array.size(m) > 0 ? "[\"" + array.join(m, "\",\"") + "\"]" : "[]"
+    out
+
+f_json(string evType, string dirS, bool first, bool second, bool confirmed, int cnt, float absLvl, float rv, float eff, string reason, bool trade, float entry, float sl, float tp, float rr, float riskPts, float qty, float fa, float fb, int swId, float swA, float swB) =>
+    string ts = str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+    string id = syminfo.tickerid + "|" + timeframe.period + "|" + evType + "|" + dirS + "|" + str.tostring(time_close)
+    float rp = (trade and not na(riskPts) and not na(entry)) ? riskPts / entry * 100 : na
+    bool inFib = not na(fa) and not na(fb) and low <= math.max(fa, fb) + fibTol and high >= math.min(fa, fb) - fibTol
+    string zs = f_zoneS()
+    string absDir = na
+    if dirS == "LONG"
+        absDir := "selling"
+    else if dirS == "SHORT"
+        absDir := "buying"
+    string tok = na
+    if webhookToken != ""
+        tok := webhookToken
+    string j = "{"
+    j += "\"event_id\":" + f_s(id)
+    j += ",\"event_type\":" + f_s(evType)
+    j += ",\"timestamp\":" + f_s(ts)
+    j += ",\"symbol\":" + f_s(syminfo.ticker)
+    j += ",\"exchange\":" + f_s(syminfo.prefix)
+    j += ",\"timeframe\":" + f_s(timeframe.period)
+    j += ",\"market_context\":{\"trend_1h\":" + f_s(f_trendS(tMid)) + ",\"trend_4h\":" + f_s(f_trendS(tHigh))
+    j += ",\"htf_mid_tf\":" + f_s(htfMid) + ",\"htf_high_tf\":" + f_s(htfHigh)
+    j += ",\"market_state\":" + f_s(f_ctxS(mState)) + ",\"trend_alignment\":" + f_b(trendAligned) + "}"
+    j += ",\"valuation\":{\"daily_high\":" + f_n(dayH) + ",\"daily_low\":" + f_n(dayL) + ",\"daily_open\":" + f_n(dayO)
+    j += ",\"vwap\":" + f_n(vwap) + ",\"range_position\":" + f_n(f_pos(close)) + ",\"valuation_zone\":" + f_s(zs)
+    j += ",\"fibonacci_705\":" + f_n(fa) + ",\"fibonacci_886\":" + f_n(fb)
+    j += ",\"fibonacci_ratios\":[" + f_n(fibA) + "," + f_n(fibB) + "]"
+    j += ",\"inside_fibonacci_zone\":" + f_b(inFib)
+    j += ",\"swing_id\":" + (na(swId) ? "null" : str.tostring(swId)) + ",\"swing_start\":" + f_n(swA) + ",\"swing_end\":" + f_n(swB) + "}"
+    j += ",\"absorption\":{\"direction\":" + f_s(absDir)
+    j += ",\"first_attempt\":" + f_b(first) + ",\"second_attempt\":" + f_b(second) + ",\"attempt_count\":" + str.tostring(cnt)
+    j += ",\"relative_volume\":" + f_n(rv) + ",\"price_efficiency\":" + f_n(eff)
+    j += ",\"failed_continuation\":" + f_b(first and evType != "TRADE_CLOSED") + ",\"confirmation\":" + f_b(confirmed) + ",\"absorption_level\":" + f_n(absLvl) + "}"
+    j += ",\"trade_setup\":{\"direction\":" + f_s(dirS) + ",\"entry\":" + f_n(entry) + ",\"stop_loss\":" + f_n(sl) + ",\"take_profit\":" + f_n(tp)
+    j += ",\"risk_reward\":" + f_n(rr) + ",\"risk_points\":" + f_n(riskPts) + ",\"risk_percent\":" + f_n(rp) + ",\"position_size\":" + f_n(qty)
+    j += ",\"account_risk_percent\":" + f_n(riskPct) + "}"
+    j += ",\"risk_management\":{\"daily_trades\":" + str.tostring(bk.tradesToday) + ",\"daily_losses\":" + str.tostring(bk.lossesToday)
+    j += ",\"daily_pnl\":" + f_n(bk.dayPnl) + ",\"trading_allowed\":" + f_b(not bk.blocked) + ",\"max_trades\":" + str.tostring(maxTrades) + ",\"max_losses\":" + str.tostring(maxLosses) + "}"
+    j += ",\"reason\":" + f_s(reason)
+    j += ",\"data_quality\":{\"missing_fields\":" + f_missing(trade, entry, sl, tp, rr, qty, rv, eff, fa, fb)
+    j += ",\"unavailable_sources\":[\"volume_profile\",\"order_flow_delta\",\"footprint\",\"liquidations\"]"
+    j += ",\"data_source\":\"TradingView\",\"confirmed_bar\":" + f_b(barstate.isconfirmed) + ",\"repainting_risk\":" + f_b(not htfConfirmedOnly) + "}"
+    j += ",\"meta\":{\"schema_version\":\"" + SCHEMA + "\",\"indicator\":\"SAR " + VERSION + "\",\"auth\":" + f_s(tok) + "}"
+    j += "}"
+    j
+
+f_emit(string msg) =>
+    if sendJson
+        alert(msg, alert.freq_all)
+
+// ============================== GESTIONE OPERAZIONI E LIMITI ========================
+f_pv() => pvOverride > 0 ? pvOverride : syminfo.pointvalue
+
+// Quantita' dal rischio per operazione: tiene conto di distanza stop, valore per punto,
+// commissioni e slippage. Non assume lo stesso valore per punto su tutti gli strumenti.
+f_qty(float entry, float sl) =>
+    float pv = f_pv()
+    float riskAmt = capital * riskPct / 100
+    float slip = slipTicks * syminfo.mintick
+    float dist = math.abs(entry - sl) + 2 * slip
+    float cost = (entry + sl) * pv * commPct / 100 + 2 * commFixed
+    float lossU = dist * pv + cost
+    float q = lossU > 0 ? riskAmt / lossU : na
+    if not na(q) and maxLeverage > 0 and entry * pv > 0
+        q := math.min(q, capital * maxLeverage / (entry * pv))
+    if not na(q) and qtyStep > 0
+        q := math.floor(q / qtyStep) * qtyStep
+    q
+
+f_blockcheck(Bk b) =>
+    if not b.blocked and (b.tradesToday >= maxTrades or b.lossesToday >= maxLosses)
+        b.blocked := true
+        b.blockReason := b.lossesToday >= maxLosses ? "max_daily_stop_losses" : "max_daily_trades"
+        f_emit(f_json("DAILY_BLOCK", "NONE", false, false, false, 0, na, na, na, b.blockReason, false, na, na, na, na, na, na, na, na, na, na, na))
+
+f_manage(Bk b) =>
+    if conf and b.inTrade and bar_index > b.idx
+        bool hitSL = b.dir == 1 ? low <= b.sl : high >= b.sl
+        bool hitTP = b.dir == 1 ? high >= b.tp : low <= b.tp
+        if hitSL or hitTP
+            bool isLoss = hitSL // se SL e TP nella stessa barra: ipotesi prudente = stop
+            float ex = isLoss ? b.sl - b.dir * slipTicks * syminfo.mintick : b.tp
+            float pv = f_pv()
+            float gross = b.qty * pv * b.dir * (ex - b.entry)
+            float cost = b.qty * (pv * (b.entry + ex) * commPct / 100 + 2 * commFixed)
+            float pnl = gross - cost
+            float rres = b.riskAmt > 0 ? pnl / b.riskAmt : na
+            b.dayPnl += pnl
+            b.totalTrades += 1
+            b.sumR += nz(rres)
+            if isLoss
+                b.lossesToday += 1
+                b.losses += 1
+            else
+                b.wins += 1
+            if not na(b.lnE)
+                line.set_x2(b.lnE, bar_index)
+                line.set_x2(b.lnS, bar_index)
+                line.set_x2(b.lnT, bar_index)
+            f_emit(f_json("TRADE_CLOSED", b.dir == 1 ? "LONG" : "SHORT", true, true, true, 0, na, na, na, isLoss ? "stop_loss_hit" : "take_profit_hit", true, b.entry, b.sl, b.tp, b.rr, b.dir * (b.entry - b.sl), b.qty, na, na, na, na, na))
+            b.inTrade := false
+            f_blockcheck(b)
+
+// Elabora gli eventi di un tracker: disegni, alert JSON, gate finali e apertura dell'operazione.
+f_process(Trk t, Bk b, int d, float fa, float fb, int swId, float swA, float swB, float tgtSwing, float tgtPivot) =>
+    string dirS = d == 1 ? "LONG" : "SHORT"
+    color c = d == 1 ? cLong : cShort
+    // --- invalidazione
+    if t.evF == 4
+        b.lastInv := bar_index
+        if showLabels
+            label.new(bar_index, d == 1 ? low : high, "x", xloc=xloc.bar_index, yloc=yloc.price, style=d == 1 ? label.style_label_up : label.style_label_down, color=color.new(color.gray, 30), textcolor=color.white, size=size.tiny, tooltip="Invalidato: " + t.reason)
+        if not na(t.lvl)
+            line.set_color(t.lvl, color.new(color.gray, 40))
+            t.lvl := na
+        f_emit(f_json("INVALIDATION", dirS, t.invFirst, t.invSecond, false, t.invCnt, d * t.invLvl, na, na, t.reason, false, na, na, na, na, na, na, fa, fb, swId, swA, swB))
+    // --- tentativi
+    if t.evA > 0
+        int idx = t.evA == 1 ? t.a1Idx : t.aLIdx
+        float ext = d * (t.evA == 1 ? t.a1Ext : t.aLExt)
+        float rv = t.evA == 1 ? t.a1RelVol : t.aLRelVol
+        float ef = t.evA == 1 ? t.a1Eff : t.aLEff
+        float lvlP = d * math.min(t.a1Ext, t.aLExt)
+        if showLabels
+            label.new(idx, ext, str.tostring(t.cnt), xloc=xloc.bar_index, yloc=yloc.price, style=d == 1 ? label.style_label_up : label.style_label_down, color=color.new(c, 20), textcolor=color.white, size=size.small, tooltip=(t.evA == 1 ? "Primo" : "Secondo") + " tentativo fallito (" + dirS + ")")
+        if t.evA == 1
+            t.lvl := line.new(t.a1Idx, lvlP, bar_index, lvlP, xloc=xloc.bar_index, color=color.new(c, 10), style=line.style_dotted, width=2)
+        else if not na(t.lvl)
+            line.set_y1(t.lvl, lvlP)
+            line.set_y2(t.lvl, lvlP)
+        f_emit(f_json(t.evA == 1 ? "FIRST_ATTEMPT" : "SECOND_ATTEMPT", dirS, true, t.evA == 2, false, t.cnt, lvlP, rv, ef, na, false, na, na, na, na, na, na, fa, fb, swId, swA, swB))
+    // --- conferma: gate finali
+    if t.evF == 3
+        float entry = close
+        float absLvl = d * math.min(t.a1Ext, t.aLExt)
+        float sl = absLvl - d * slAtrMargin * atr
+        float riskPts = d * (entry - sl)
+        float tp = na
+        if tpMode == "Livello strutturale piu' vicino"
+            array<float> lv = array.new<float>()
+            array.push(lv, d * prevDayH)
+            array.push(lv, d * prevDayL)
+            array.push(lv, d * dayH)
+            array.push(lv, d * dayL)
+            array.push(lv, d * dayO)
+            array.push(lv, d * vwap)
+            array.push(lv, d * dayMid)
+            array.push(lv, d * sAH)
+            array.push(lv, d * sAL)
+            array.push(lv, d * sAlH)
+            array.push(lv, d * sAlL)
+            array.push(lv, d * sBH)
+            array.push(lv, d * sBL)
+            array.push(lv, d * sBlH)
+            array.push(lv, d * sBlL)
+            array.push(lv, d * tgtSwing)
+            array.push(lv, d * tgtPivot)
+            tp := d * f_nearest(lv, d * entry + tpMinATR * atr)
+        else if tpMode == "Swing opposto (Fib 0)"
+            tp := tgtSwing
+        else
+            tp := entry + d * tpFixedR * riskPts
+        float rr = (not na(tp) and riskPts > 0) ? d * (tp - entry) / riskPts : na
+        float qty = riskPts > 0 ? f_qty(entry, sl) : na
+        float pE = f_pos(entry)
+        string why = ""
+        if b.inTrade
+            why := "trade_already_open"
+        else if b.tradesToday >= maxTrades
+            why := "daily_trades_limit"
+        else if b.lossesToday >= maxLosses
+            why := "daily_stop_loss_limit"
+        else if na(atr) or not (riskPts > 0)
+            why := "invalid_stop_geometry"
+        else if riskPts > maxStopATR * atr
+            why := "stop_too_wide_atr"
+        else if riskPts / entry * 100 > maxStopPct
+            why := "stop_too_wide_pct"
+        else if na(pE) or (d == 1 ? pE >= entryLimit : pE <= 1 - entryLimit)
+            why := "entry_in_unfavorable_half_of_range"
+        else if na(tp) or d * (tp - entry) <= 0
+            why := "no_valid_target"
+        else if rr < minRR
+            why := "risk_reward_below_minimum"
+        else if na(qty) or qty <= 0
+            why := "position_size_zero"
+        if why != ""
+            b.lastInv := bar_index
+            if showLabels
+                label.new(bar_index, d == 1 ? low : high, "x", xloc=xloc.bar_index, yloc=yloc.price, style=d == 1 ? label.style_label_up : label.style_label_down, color=color.new(color.gray, 30), textcolor=color.white, size=size.tiny, tooltip="Setup scartato: " + why)
+            f_emit(f_json("INVALIDATION", dirS, true, true, false, t.cnt, absLvl, t.aLRelVol, t.aLEff, why, true, entry, sl, tp, rr, riskPts, qty, fa, fb, swId, swA, swB))
+        else
+            b.inTrade := true
+            b.dir := d
+            b.entry := entry
+            b.sl := sl
+            b.tp := tp
+            b.qty := qty
+            b.riskAmt := capital * riskPct / 100
+            b.rr := rr
+            b.idx := bar_index
+            b.tradesToday += 1
+            b.sigDir := d
+            b.lastConf := bar_index
+            if not na(t.lvl)
+                line.set_x2(t.lvl, bar_index)
+                line.set_style(t.lvl, line.style_solid)
+            b.lnE := line.new(bar_index, entry, bar_index + 1, entry, xloc=xloc.bar_index, color=color.new(c, 0), width=1)
+            b.lnS := line.new(bar_index, sl, bar_index + 1, sl, xloc=xloc.bar_index, color=color.new(cShort, 0), width=1, style=line.style_dashed)
+            b.lnT := line.new(bar_index, tp, bar_index + 1, tp, xloc=xloc.bar_index, color=color.new(cLong, 0), width=1, style=line.style_dashed)
+            if showLabels
+                string txt = dirS + (d == 1 ? " ▲" : " ▼") + "\nE " + str.tostring(entry, format.mintick) + "\nSL " + str.tostring(sl, format.mintick) + " (" + str.tostring(riskPts / entry * 100, "#.##") + "%)\nTP " + str.tostring(tp, format.mintick) + "\nR:R " + str.tostring(rr, "#.##") + "\nQty " + str.tostring(qty)
+                label.new(bar_index, entry, txt, xloc=xloc.bar_index, yloc=yloc.price, style=d == 1 ? label.style_label_up : label.style_label_down, color=color.new(c, 10), textcolor=color.white, size=size.normal)
+            f_emit(f_json("CONFIRMATION", dirS, true, true, true, t.cnt, absLvl, t.aLRelVol, t.aLEff, na, true, entry, sl, tp, rr, riskPts, qty, fa, fb, swId, swA, swB))
+            f_blockcheck(b)
+        f_reset(t)
+        t.lvl := na
+    // estendi la linea del livello finche' il setup e' attivo
+    if t.state > 0 and not na(t.lvl)
+        line.set_x2(t.lvl, bar_index)
+
+// ============================== ESECUZIONE ==========================================
+var Trk lg = Trk.new()
+var Trk sh = Trk.new()
+
+bk.sigDir := 0
+if conf
+    if newDay
+        bk.tradesToday := 0
+        bk.lossesToday := 0
+        bk.dayPnl := 0.0
+        bk.blocked := false
+        bk.blockReason := ""
+    f_manage(bk)
+
+// Localizzazione candela: LONG nella zona bassa del range e nella zona Fib; SHORT speculare.
+bool locL = rangeValid and f_pos(low) <= underPct
+bool locS = rangeValid and f_pos(high) >= overPct
+bool fibL = upOk and low <= upFibA + fibTol and low >= upFibB - fibTol and high >= upFibB
+bool fibS = dnOk and high >= dnFibA - fibTol and high <= dnFibB + fibTol and low <= dnFibB
+bool allowL = mState == 1 and not bk.blocked
+bool allowS = mState == -1 and not bk.blocked
+
+f_step(lg, allowL, allowL and locL and fibL, upOk, upId, open, high, low, close, lowestN)
+f_step(sh, allowS, allowS and locS and fibS, dnOk, dnId, -open, -low, -high, -close, na(highestN) ? na : -highestN)
+
+if conf
+    f_process(lg, bk, 1, upFibA, upFibB, upId, upA, upB, upB, pHiP)
+    f_process(sh, bk, -1, dnFibA, dnFibB, dnId, dnA, dnB, dnB, pLoP)
+
+// ============================== GRAFICA =============================================
+// Zone valutazione
+bool  showRng = showZones and not newDay
+float uTop = rangeValid ? dayL + underPct * dayRng : na
+float oBot = rangeValid ? dayL + overPct * dayRng : na
+pH = plot(showRng ? dayH : na, "Massimo giornaliero", color=color.new(color.gray, 20), style=plot.style_linebr)
+pL = plot(showRng ? dayL : na, "Minimo giornaliero", color=color.new(color.gray, 20), style=plot.style_linebr)
+pU = plot(showRng ? uTop : na, "Limite sottovalutazione", color=color.new(cLong, 70), style=plot.style_linebr)
+pO = plot(showRng ? oBot : na, "Limite sopravvalutazione", color=color.new(cShort, 70), style=plot.style_linebr)
+plot(showRng ? dayMid : na, "Equilibrio range", color=color.new(color.gray, 60), style=plot.style_linebr)
+plot(showRng ? dayO : na, "Apertura giornaliera", color=color.new(color.silver, 50), style=plot.style_linebr)
+plot(showZones and not newDay ? vwap : na, "VWAP giornaliera", color=color.new(color.orange, 10), linewidth=2, style=plot.style_linebr)
+fill(pL, pU, color=color.new(cLong, 90), title="Zona sottovalutazione")
+fill(pO, pH, color=color.new(cShort, 90), title="Zona sopravvalutazione")
+bgcolor(mState == 1 ? color.new(cLong, 96) : mState == -1 ? color.new(cShort, 96) : na, title="Stato mercato")
+
+// Swing e zona Fibonacci: ogni nuovo swing viene disegnato e il precedente archiviato in grigio.
+var box  bxUp = na
+var line lnUp = na
+var box  bxDn = na
+var line lnDn = na
+if conf and showFib
+    if upNew
+        if not na(bxUp)
+            box.set_bgcolor(bxUp, color.new(color.gray, 92))
+            box.set_border_color(bxUp, color.new(color.gray, 70))
+            line.set_color(lnUp, color.new(color.gray, 60))
+        bxUp := box.new(upBi, math.max(upFibA, upFibB), bar_index, math.min(upFibA, upFibB), xloc=xloc.bar_index, border_color=color.new(cLong, 40), bgcolor=color.new(cLong, 85))
+        lnUp := line.new(upAi, upA, upBi, upB, xloc=xloc.bar_index, color=color.new(cLong, 30), style=line.style_dashed)
+        if showLabels
+            label.new(upBi, upB, "Swing #" + str.tostring(upId) + " ↻", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down, color=color.new(cLong, 60), textcolor=color.white, size=size.tiny, tooltip="Nuovo swing di riferimento LONG: A=" + str.tostring(upA, format.mintick) + " B=" + str.tostring(upB, format.mintick))
+    if dnNew
+        if not na(bxDn)
+            box.set_bgcolor(bxDn, color.new(color.gray, 92))
+            box.set_border_color(bxDn, color.new(color.gray, 70))
+            line.set_color(lnDn, color.new(color.gray, 60))
+        bxDn := box.new(dnBi, math.max(dnFibA, dnFibB), bar_index, math.min(dnFibA, dnFibB), xloc=xloc.bar_index, border_color=color.new(cShort, 40), bgcolor=color.new(cShort, 85))
+        lnDn := line.new(dnAi, dnA, dnBi, dnB, xloc=xloc.bar_index, color=color.new(cShort, 30), style=line.style_dashed)
+        if showLabels
+            label.new(dnBi, dnB, "Swing #" + str.tostring(dnId) + " ↻", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_up, color=color.new(cShort, 60), textcolor=color.white, size=size.tiny, tooltip="Nuovo swing di riferimento SHORT: A=" + str.tostring(dnA, format.mintick) + " B=" + str.tostring(dnB, format.mintick))
+    if upOk and not na(bxUp)
+        box.set_right(bxUp, bar_index)
+    if dnOk and not na(bxDn)
+        box.set_right(bxDn, bar_index)
+if conf and showFib
+    if not upOk and not na(bxUp)
+        box.set_bgcolor(bxUp, color.new(color.gray, 92))
+    if not dnOk and not na(bxDn)
+        box.set_bgcolor(bxDn, color.new(color.gray, 92))
+
+// Tracciamento delle linee dell'operazione aperta
+if conf and bk.inTrade and not na(bk.lnE)
+    line.set_x2(bk.lnE, bar_index + 1)
+    line.set_x2(bk.lnS, bar_index + 1)
+    line.set_x2(bk.lnT, bar_index + 1)
+
+// Alert leggibili (senza JSON) per notifiche classiche
+alertcondition(bk.sigDir == 1, "SAR: segnale LONG confermato", "Smart Absorption Radar: LONG confermato su {{ticker}} {{interval}}")
+alertcondition(bk.sigDir == -1, "SAR: segnale SHORT confermato", "Smart Absorption Radar: SHORT confermato su {{ticker}} {{interval}}")
+
+// ============================== PANNELLO ============================================
+string tpos = panelPos == "In alto a destra" ? position.top_right : panelPos == "In alto a sinistra" ? position.top_left : panelPos == "In basso a destra" ? position.bottom_right : position.bottom_left
+string tsz = panelSize == "Piccola" ? size.small : panelSize == "Grande" ? size.large : size.normal
+var table tb = table.new(tpos, 2, 12, border_width=1, frame_width=1, frame_color=color.new(color.gray, 60), border_color=color.new(color.gray, 75))
+
+f_row(int r, string k, string v, color vc) =>
+    table.cell(tb, 0, r, k, text_color=chart.fg_color, bgcolor=color.new(color.gray, 85), text_size=tsz, text_halign=text.align_left)
+    table.cell(tb, 1, r, v, text_color=chart.fg_color, bgcolor=color.new(vc, 70), text_size=tsz, text_halign=text.align_left)
+
+f_dirT(int x) => x == 1 ? "RIALZISTA" : x == -1 ? "RIBASSISTA" : "NEUTRO"
+f_dirC(int x) => x == 1 ? cLong : x == -1 ? cShort : color.gray
+
+if barstate.islast and showPanel
+    int actDir = lg.state > 0 ? 1 : sh.state > 0 ? -1 : bk.inTrade ? bk.dir : 0
+    int maxSt = math.max(lg.state, sh.state)
+    string setupT = maxSt == 2 ? "SECONDO TENTATIVO" : maxSt == 1 ? "PRIMO TENTATIVO" : (bk.inTrade or bar_index - bk.lastConf <= 20) ? "CONFERMATO" : (bar_index - bk.lastInv <= 20) ? "INVALIDATO" : "IN ATTESA"
+    color setupC = maxSt > 0 ? color.orange : (setupT == "CONFERMATO") ? color.green : (setupT == "INVALIDATO") ? color.gray : color.new(color.gray, 50)
+    string dirT = actDir == 1 ? "LONG" : actDir == -1 ? "SHORT" : "NESSUNA"
+    color decC = claudeDecision == "ENTRARE" ? color.green : claudeDecision == "SALTARE" ? color.red : claudeDecision == "ASPETTARE" ? color.orange : color.gray
+    float lossPct = math.max(0.0, -bk.dayPnl) / capital * 100
+    float resid = math.max(0.0, maxLosses * riskPct - lossPct)
+    string warn = ""
+    if not htfOk
+        warn += "HTF non valido; "
+    if not volAvail
+        warn += "volume assente; "
+    if not htfConfirmedOnly
+        warn += "HTF non confermato; "
+    if not rangeValid
+        warn += "range non valido; "
+    f_row(0, "CONTESTO", mState == 1 ? "RIALZISTA" : mState == -1 ? "RIBASSISTA" : "EQUILIBRIO", f_dirC(mState))
+    f_row(1, "TF " + htfMid, f_dirT(tMid), f_dirC(tMid))
+    f_row(2, "TF " + htfHigh, f_dirT(tHigh), f_dirC(tHigh))
+    f_row(3, "SETUP", setupT, setupC)
+    f_row(4, "DIREZIONE", dirT, f_dirC(actDir))
+    f_row(5, "DECISIONE CLAUDE", claudeDecision, decC)
+    f_row(6, "OPERAZIONI", str.tostring(bk.tradesToday) + "/" + str.tostring(maxTrades), bk.tradesToday >= maxTrades ? color.red : color.gray)
+    f_row(7, "STOP LOSS", str.tostring(bk.lossesToday) + "/" + str.tostring(maxLosses), bk.lossesToday >= maxLosses ? color.red : color.gray)
+    f_row(8, "RISCHIO RESIDUO", str.tostring(resid, "#.##") + "%", color.gray)
+    f_row(9, "RISULTATO GIORNO", str.tostring(bk.dayPnl, "#.##"), bk.dayPnl < 0 ? color.red : bk.dayPnl > 0 ? color.green : color.gray)
+    f_row(10, "STATO", bk.blocked ? "BLOCCATO: " + bk.blockReason : "ATTIVO", bk.blocked ? color.red : color.green)
+    f_row(11, "DATI", warn == "" ? "OK" : warn, warn == "" ? color.gray : color.orange)
