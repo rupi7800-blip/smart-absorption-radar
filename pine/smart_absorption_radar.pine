@@ -684,7 +684,7 @@ f_manage(Bk b) =>
                 line.set_x2(b.lnE, bar_index)
                 line.set_x2(b.lnS, bar_index)
                 line.set_x2(b.lnT, bar_index)
-            f_emit(f_json("TRADE_CLOSED", b.dir == 1 ? "LONG" : "SHORT", true, true, true, 0, na, na, na, isLoss ? "stop_loss_hit" : "take_profit_hit", true, b.entry, b.sl, b.tp, na, na, b.qty, na, na, na, na, na))
+            f_emit(f_json("TRADE_CLOSED", b.dir == 1 ? "LONG" : "SHORT", true, true, true, 0, na, na, na, isLoss ? "stop_loss_hit" : "take_profit_hit", true, b.entry, b.sl, b.tp, b.rr, b.dir * (b.entry - b.sl), b.qty, na, na, na, na, na))
             b.inTrade := false
             f_blockcheck(b)
 
