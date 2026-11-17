@@ -94,6 +94,13 @@ CONTESTO, direzione di entrambi gli HTF, SETUP, DIREZIONE, DECISIONE CLAUDE, ope
 - Un'operazione chiusa e una nuova possono avvenire sulla stessa barra: i limiti giornaliero si applicano comunque al momento dell'apertura.
 - Un assorbimento valido sulla stessa barra di un'invalidazione non avvia un nuovo setup: riparte dalla barra successiva (scelta prudente).
 
+## Punti da verificare nel Pine Editor (non verificabili senza compilatore)
+
+- `na()` applicato a variabili `string` (`f_s`, `f_zoneS`).
+- `table.new` con posizione ricavata da un input (`tpos`).
+- Comportamento in tempo reale dei campi UDT dichiarati con `var` (le modifiche sono comunque confinate a barra chiusa).
+- Shadowing dei nomi `ph`/`pl` tra `f_htf_trend` e le variabili globali.
+
 ## Limiti noti
 
 - Nessuna verifica di compilazione, backtest o paper trading ancora eseguiti.

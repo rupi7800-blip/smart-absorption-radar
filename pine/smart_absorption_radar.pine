@@ -311,6 +311,8 @@ float pl = conf ? plRaw : na
 
 var int   lastPiv = 0
 var float pHiP = na
+var int   pHiI = na
+var int   pLoI = na
 var float pLoP = na
 var float upA = na
 var float upB = na
@@ -342,13 +344,14 @@ if not na(ph)
             bool repl = not upOk or ph > upB or bar_index - upBi > swingMaxAge
             if big and repl
                 upA := pLoP
-                upAi := bar_index - pivR
+                upAi := pLoI
                 upB := ph
                 upBi := bar_index - pivR
                 upOk := true
                 upId += 1
                 upNew := true
         pHiP := ph
+        pHiI := bar_index - pivR
         lastPiv := 1
 if not na(pl)
     if lastPiv != -1 or pl < pLoP
@@ -358,13 +361,14 @@ if not na(pl)
             bool repl = not dnOk or pl < dnB or bar_index - dnBi > swingMaxAge
             if big and repl
                 dnA := pHiP
-                dnAi := bar_index - pivR
+                dnAi := pHiI
                 dnB := pl
                 dnBi := bar_index - pivR
                 dnOk := true
                 dnId += 1
                 dnNew := true
         pLoP := pl
+        pLoI := bar_index - pivR
         lastPiv := -1
 
 // Livelli Fibonacci (prezzi) per LONG (ritracciamento da B verso A) e SHORT (da B verso A).
@@ -576,10 +580,8 @@ f_missing(bool trade, float entry, float sl, float tp, float rr, float qty, floa
             array.push(m, "risk_reward")
         if na(qty)
             array.push(m, "position_size")
-    string out = "["
-    for i = 0 to array.size(m) - 1
-        out += (i > 0 ? "," : "") + "\"" + array.get(m, i) + "\""
-    out += "]"
+    // Con array vuoto "0 to -1" conterebbe all'indietro: si usa join.
+    string out = array.size(m) > 0 ? "[\"" + array.join(m, "\",\"") + "\"]" : "[]"
     out
 
 f_json(string evType, string dirS, bool first, bool second, bool confirmed, int cnt, float absLvl, float rv, float eff, string reason, bool trade, float entry, float sl, float tp, float rr, float riskPts, float qty, float fa, float fb, int swId, float swA, float swB) =>
@@ -615,7 +617,7 @@ f_json(string evType, string dirS, bool first, bool second, bool confirmed, int 
     j += ",\"absorption\":{\"direction\":" + f_s(absDir)
     j += ",\"first_attempt\":" + f_b(first) + ",\"second_attempt\":" + f_b(second) + ",\"attempt_count\":" + str.tostring(cnt)
     j += ",\"relative_volume\":" + f_n(rv) + ",\"price_efficiency\":" + f_n(eff)
-    j += ",\"failed_continuation\":" + f_b(first) + ",\"confirmation\":" + f_b(confirmed) + ",\"absorption_level\":" + f_n(absLvl) + "}"
+    j += ",\"failed_continuation\":" + f_b(first and evType != "TRADE_CLOSED") + ",\"confirmation\":" + f_b(confirmed) + ",\"absorption_level\":" + f_n(absLvl) + "}"
     j += ",\"trade_setup\":{\"direction\":" + f_s(dirS) + ",\"entry\":" + f_n(entry) + ",\"stop_loss\":" + f_n(sl) + ",\"take_profit\":" + f_n(tp)
     j += ",\"risk_reward\":" + f_n(rr) + ",\"risk_points\":" + f_n(riskPts) + ",\"risk_percent\":" + f_n(rp) + ",\"position_size\":" + f_n(qty)
     j += ",\"account_risk_percent\":" + f_n(riskPct) + "}"
